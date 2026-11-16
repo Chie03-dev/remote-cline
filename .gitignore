@@ -1,6 +1,9 @@
 node_modules/
 out/
 *.vsix
-.vscode/
 .DS_Store
 Thumbs.db
+# User-specific VS Code settings (launch.json and tasks.json are committed)
+.vscode/*
+!.vscode/launch.json
+!.vscode/tasks.json
