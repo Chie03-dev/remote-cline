@@ -1,0 +1,37 @@
+{
+  "name": "agent-bridge",
+  "displayName": "Agent Bridge",
+  "description": "Spike: lightweight phone bridge to Cline via WebSocket",
+  "version": "0.0.1",
+  "engines": {
+    "vscode": "^1.101.0"
+  },
+  "categories": ["AI"],
+  "publisher": "local",
+  "activationEvents": [
+    "onStartupFinished",
+    "onCommand:agent-bridge.spike"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "agent-bridge.spike",
+        "title": "Agent Bridge: Spike"
+      }
+    ]
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "@types/vscode": "^1.101.0",
+    "typescript": "^5.8.0"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
