@@ -133,7 +133,7 @@ export function activate(context: vscode.ExtensionContext): void {
       let lines: string[] = [];
       try {
         const content = fs.readFileSync(file, 'utf8');
-        lines = content.split(/\r?\n/).filter(l => l.trim().length > 0);
+        lines = content.split(/\r?\n/).filter((l: string) => l.trim().length > 0);
       } catch (e) {
         output.appendLine(`  read error: ${e}`);
         return;
@@ -166,7 +166,7 @@ export function activate(context: vscode.ExtensionContext): void {
 
     // Try fs.watch on the directory (recursive not reliably supported on Windows)
     try {
-      watcher = fs.watch(dir, { recursive: true }, (eventType, filename) => {
+      watcher = fs.watch(dir, { recursive: true }, (eventType: string, filename: string | null) => {
         if (!filename) return;
         const full = path.join(dir, filename);
         const lower = filename.toLowerCase();
