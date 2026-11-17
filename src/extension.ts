@@ -237,7 +237,87 @@ export function activate(context: vscode.ExtensionContext): void {
 
   output.appendLine('Setup complete. Run "Agent Bridge: Spike" to start a task and watch storage.');
   output.show(true);
+
+  // ------------------------------------------------------------------
+  // 7. Auto-start the storage watcher (poll until storage appears)
+  // ------------------------------------------------------------------
+  let watchRetryTimer: any = null;
+
+  function ensureWatcher(): void {
+    if (watcher || pollTimer) return;
+    if (clineStorageDir && fs.existsSync(clineStorageDir)) {
+      startWatching(clineStorageDir);
+      return;
+    }
+    output.appendLine(`Cline storage not found yet: ${clineStorageDir}. Waiting...`);
+    watchRetryTimer = setInterval(() => {
+      if (clineStorageDir && fs.existsSync(clineStorageDir)) {
+        clearInterval(watchRetryTimer);
+        watchRetryTimer = null;
+        startWatching(clineStorageDir);
+        output.appendLine('Storage detected — watching now.');
+      }
+    }, 2000);
+  }
+
+  ensureWatcher();
+
+  // ------------------------------------------------------------------
+  // 8. Input box: type a prompt and send it directly to Cline
+  // ------------------------------------------------------------------
+  const inputBox = vscode.window.createInputBox();
+  inputBox.title = 'Agent Bridge — prompt to Cline';
+  inputBox.placeholder = 'Type a prompt and press Enter to send...';
+  inputBox.ignoreFocusOut = false;
+  inputBox.prompt = 'Send as new task (default), or send as message?';
+  inputBox.value = '';
+
+  const modePick = vscode.window.createQuickPick();
+  modePick.title = 'Send mode';
+  modePick.placeholder = 'How to send the prompt';
+  modePick.items = [
+    { label: 'Start new task', description: 'startNewTask(prompt)', picked: true },
+    { label: 'Send as message', description: 'sendMessage(prompt)', picked: false },
+  ];
+  modePick.ignoreFocusOut = false;
+
+  inputBox.onDidAccept(async () => {
+    const text = inputBox.value.trim();
+    if (!text) {
+      inputBox.value = '';
+      return;
+    }
+    if (modePick.selectedItems.length === 0) {
+      modePick.show();
+      inputBox.hide();
+      return;
+    }
+    const active = modePick.selectedItems[0];
+    try {
+      if (active.label === 'Start new task') {
+        await (cline.startNewTask as (...args: unknown[]) => Promise<void>)(text);
+        output.appendLine(`startNewTask("${text.substring(0, 40)}...") sent.`);
+      } else {
+        await (cline.sendMessage as (msg: string) => Promise<void>)(text);
+        output.appendLine(`sendMessage("${text.substring(0, 40)}...") sent.`);
+      }
+    } catch (e) {
+      output.appendLine(`Send error: ${e}`);
+    }
+    inputBox.value = '';
+    modePick.hide();
+    inputBox.show();
+  });
+
+  modePick.onDidAccept(() => {
+    modePick.hide();
+    inputBox.show();
+  });
+
+  inputBox.show();
 }
+
+
 
 export function deactivate(): void {
   // nothing to clean up (no writes were ever made to Cline's files)
