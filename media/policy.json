@@ -1,0 +1,32 @@
+[
+  {
+    "match": "prompt",
+    "pattern": "",
+    "action": "allow"
+  },
+  {
+    "match": "message",
+    "pattern": "",
+    "action": "ask"
+  },
+  {
+    "match": "approve",
+    "pattern": "",
+    "action": "ask"
+  },
+  {
+    "match": "reject",
+    "pattern": "",
+    "action": "ask"
+  },
+  {
+    "match": "cancel",
+    "pattern": "",
+    "action": "allow"
+  },
+  {
+    "match": "*",
+    "pattern": "",
+    "action": "deny"
+  }
+]
