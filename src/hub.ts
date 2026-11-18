@@ -93,7 +93,7 @@ export class Hub {
     }
   }
 
-  private handlePhoneMessage = (event: any): void => {
+  public handlePhoneMessage = (event: any): void => {
     try {
       const msg: HubMessage = JSON.parse(event.data as string)
       this.handleIncoming(msg)
@@ -102,7 +102,7 @@ export class Hub {
     }
   }
 
-  private handleIncoming(msg: HubMessage): void {
+  public handleIncoming(msg: HubMessage): void {
     this.auditLog(`PHONE->HUB:${JSON.stringify(msg)}`)
     this.onPhoneMessage(msg)
 
