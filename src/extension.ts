@@ -27,6 +27,11 @@ export function activate(context: vscode.ExtensionContext): void {
   const cline = (clineExt.exports as Record<string, unknown>) || {};
   const methodNames = cline ? Object.keys(cline) : [];
   output.appendLine(`Cline exported methods: ${methodNames.join(', ') || '(none)'}`);
+  // Diagnostic: dump every export property name + type
+  for (const k of methodNames) {
+    const v = cline[k];
+    output.appendLine(`  ${k}: ${typeof v}${v && typeof v === 'object' ? ' keys=' + Object.keys(v).join(',') : ''}`);
+  }
   output.appendLine('');
 
   const callCline = (name: string, ...args: unknown[]): unknown => {
