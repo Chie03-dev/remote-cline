@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Agent Bridge</title>
+<link rel="manifest" href="manifest.json">
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  :root {
+    --bg: #0f0f0f;
+    --bg-alt: #1a1a1a;
+    --text: #e0e0e0;
+    --muted: #888;
+    --accent: #00d9ff;
+    --success: #00ff88;
+    --danger: #ff4444;
+    --warn: #ffcc00;
+    --border: #333;
+    --card: #161616;
+    --think-bg: #121220;
+    --think-text: #888;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #f5f5f5;
+      --bg-alt: #eaeaea;
+      --text: #222;
+      --muted: #666;
+      --accent: #0066cc;
+      --success: #008844;
+      --danger: #cc0000;
+      --warn: #cc9900;
+      --border: #ccc;
+      --card: #ffffff;
+      --think-bg: #f0f0ff;
+      --think-text: #666;
+    }
+  }
+  html, body { height: 100%; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; background: var(--bg); color: var(--text); }
+  body { display: flex; flex-direction: column; max-width: 480px; margin: 0 auto; }
+  header { display: flex; align-items: center; justify-content: space-between; padding: 12px 16px; background: var(--bg-alt); border-bottom: 1px solid var(--border); }
+  header h1 { font-size: 16px; font-weight: 600; }
+  #agent-status { color: var(--muted); font-size: 14px; }
+  #status-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--danger); display: inline-block; margin-right: 6px; animation: pulse 2s infinite; }
+  #status-dot.online { background: var(--success); }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.5} }
+  .feed { flex: 1; overflow-y: auto; padding: 12px; display: flex; flex-direction: column; gap: 10px; }
+  .msg { max-width: 90%; padding: 10px 14px; border-radius: 12px; font-size: 14px; line-height: 1.4; word-wrap: break-word; }
+  .msg.say { align-self: flex-start; background: var(--card); border: 1px solid var(--border); border-bottom-left-radius: 2px; }
+  .msg.think { align-self: flex-start; background: var(--think-bg); color: var(--think-text); font-size: 13px; font-style: italic; }
+  .msg.think .collapsed { cursor: pointer; }
+  .msg.think .expanded { display: none; white-space: pre-wrap; }
+  .msg.think.show .collapsed { display: none; }
+  .msg.think.show .expanded { display: block; }
+  .msg.state { align-self: center; font-size: 11px; color: var(--muted); background: transparent; border: none; padding: 4px 0; }
+  .msg.ask { align-self: flex-start; background: var(--warn); color: #000; font-weight: 600; border-radius: 10px; }
+  .ts { font-size: 10px; color: var(--muted); margin-top: 4px; }
+  .prompt-form { padding: 12px 16px; background: var(--bg-alt); border-top: 1px solid var(--border); display: flex; gap: 8px; }
+  .prompt-form input { flex: 1; padding: 10px 14px; border: 1px solid var(--border); border-radius: 24px; background: var(--bg); color: var(--text); outline: none; }
+  .prompt-form input:focus { border-color: var(--accent); }
+  .prompt-form button { padding: 10px 18px; background: var(--accent); color: #000; border: none; border-radius: 24px; font-weight: 600; cursor: pointer; }
+  .prompt-form button:active { transform: scale(0.96); }
+  .approval-card { position: sticky; bottom: auto; margin: 10px 16px; padding: 14px; background: var(--card); border: 2px solid var(--warn); border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.3); z-index: 10; animation: slideIn 0.3s ease-out; }
+  @keyframes slideIn { from { transform: translateY(20px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
+  .approval-card.hidden { display: none; }
+  .approval-kind { font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: var(--warn); font-weight: 700; margin-bottom: 6px; }
+  .approval-text { font-size: 14px; line-height: 1.4; margin-bottom: 12px; white-space: pre-wrap; }
+  .approval-buttons { display: flex; gap: 8px; }
+  .approval-buttons button { flex: 1; padding: 10px; border: none; border-radius: 8px; font-weight: 600; cursor: pointer; }
+  .approval-buttons button#btn-approve { background: var(--success); color: #000; }
+  .approval-buttons button#btn-reject { background: var(--danger); color: #fff; }
+  .approval-buttons button:active { transform: scale(0.96); }
+  .reconnecting { align-self: center; font-size: 11px; color: var(--muted); padding: 4px 0; }
+</style>
+</head>
+<body>
+  <header>
+    <h1>Agent Bridge</h1>
+    <div id="status-indicator">
+      <span id="status-dot"></span>
+      <span id="agent-status">cline</span>
+    </div>
+  </header>
+  <div id="feed" class="feed"></div>
+  <div id="approval-card" class="approval-card hidden">
+    <div class="approval-kind" id="approval-kind">PENDING</div>
+    <div class="approval-text" id="approval-text"></div>
+    <div class="approval-buttons">
+      <button id="btn-approve">Approve</button>
+      <button id="btn-reject">Reject</button>
+    </div>
+  </div>
+  <form id="prompt-form" class="prompt-form">
+    <input id="prompt-input" type="text" placeholder="Type a prompt..." autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false">
+    <button type="submit">Send</button>
+  </form>
+  <div class="reconnecting" id="reconnecting" style="display:none">Reconnecting...</div>
+  <script>
+    (function(){
+      const WS_URL = 'ws://' + location.hostname + ':9876/ws';
+
+      const feed   = document.getElementById('feed');
+      const form   = document.getElementById('prompt-form');
+      const input  = document.getElementById('prompt-input');
+      const card   = document.getElementById('approval-card');
+      const kindEl = document.getElementById('approval-kind');
+      const textEl = document.getElementById('approval-text');
+      const dot    = document.getElementById('status-dot');
+      const agent  = document.getElementById('agent-status');
+      const recon  = document.getElementById('reconnecting');
+      const btnApprove = document.getElementById('btn-approve');
+      const btnReject  = document.getElementById('btn-reject');
+
+      let ws = null;
+      let reconnectTimeout = null;
+      let reconnectDelay = 1000;
+      let pendingAskId = null;
+      let pendingAskKind = 'command';
+
+      function ts(){ return new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'}); }
+
+      function addMsg(cls, html, scroll=true){
+        const d = document.createElement('div');
+        d.className = 'msg ' + cls;
+        d.innerHTML = html + '<div class="ts">' + ts() + '</div>';
+        feed.appendChild(d);
+        if(scroll) feed.scrollTop = feed.scrollHeight;
+        return d;
+      }
+
+      function addThink(text){
+        const d = document.createElement('div');
+        d.className = 'msg think';
+        d.innerHTML =
+          '<div class="collapsed" onclick="this.parentElement.classList.toggle(\'show\')">▾ thinking</div>' +
+          '<div class="expanded">' + text.replace(/</g,'&lt;').replace(/>/g,'&gt;') + '</div>' +
+          '<div class="ts">' + ts() + '</div>';
+        feed.appendChild(d);
+        feed.scrollTop = feed.scrollHeight;
+      }
+
+      function addAsk(id, kind, text){
+        pendingAskId = id;
+        pendingAskKind = kind || 'command';
+        kindEl.textContent = (kind||'command').toUpperCase();
+        textEl.textContent = text;
+        card.classList.remove('hidden');
+        card.scrollIntoView({behavior:'smooth', block:'nearest'});
+      }
+
+      function hideAsk(){
+        pendingAskId = null;
+        card.classList.add('hidden');
+      }
+
+      function setOnline(on){
+        dot.className = on ? 'online' : '';
+        agent.textContent = on ? 'cline · online' : 'cline · offline';
+      }
+
+      function connect(){
+        recon.style.display = 'none';
+        reconnectDelay = 1000;
+        ws = new WebSocket(WS_URL);
+        ws.onopen = () => { setOnline(true); };
+        ws.onmessage = (e) => {
+          try { handle(JSON.parse(e.data)); }
+          catch(err){ console.warn('bad msg', e.data); }
+        };
+        ws.onclose = () => {
+          setOnline(false);
+          recon.style.display = 'block';
+          reconnectTimeout = setTimeout(connect, reconnectDelay);
+          reconnectDelay = Math.min(reconnectDelay * 1.5, 30000);
+        };
+        ws.onerror = () => { ws.close(); };
+      }
+
+      function handle(m){
+        switch(m.t){
+          case 'say':
+            addMsg('say', m.text.replace(/</g,'&lt;').replace(/>/g,'&gt;'));
+            break;
+          case 'think':
+            addThink(m.text || '');
+            break;
+          case 'ask':
+            addAsk(m.id, m.kind, m.text || '');
+            break;
+          case 'state':
+            if(m.status === 'done') hideAsk();
+            addMsg('state', m.status);
+            break;
+          default:
+            console.log('unhandled', m);
+        }
+      }
+
+      function send(obj){
+        if(ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
+      }
+
+      form.onsubmit = (e) => {
+        e.preventDefault();
+        const t = input.value.trim();
+        if(!t) return;
+        addMsg('say', t.replace(/</g,'&lt;').replace(/>/g,'&gt;'), false);
+        input.value = '';
+        send({t:'prompt', agent:'cline', text:t});
+      };
+
+      btnApprove.onclick = () => {
+        if(pendingAskId){ send({t:'approve', agent:'cline', id:pendingAskId}); hideAsk(); }
+      };
+      btnReject.onclick = () => {
+        if(pendingAskId){ send({t:'reject', agent:'cline', id:pendingAskId, reason:'rejected'}); hideAsk(); }
+      };
+
+      connect();
+    })();
+  </script>
+</body>
+</html>

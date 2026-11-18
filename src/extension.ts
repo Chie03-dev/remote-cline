@@ -1,206 +1,93 @@
 import * as vscode from 'vscode';
 import * as fs from 'fs';
 import * as path from 'path';
+import { WebSocketServer, WebSocket } from 'ws';
+import { Hub } from './hub';
+import { ClineAdapter } from './adapters/cline';
 
 // ---------------------------------------------------------------------------
-// Agent Bridge — Phase 1 Spike
+// Agent Bridge — Phase 2
 //
-// Reads-only inspection of Cline's exported API and on-disk session storage.
-// Writes nothing to Cline's files. All output goes to the
-// "Agent Bridge Spike" Output Channel.
+// WebSocket server for phone UI, hub for routing/policy, ClineAdapter for
+// Cline integration. Reads-only: never writes to Cline's files.
 // ---------------------------------------------------------------------------
 
 export function activate(context: vscode.ExtensionContext): void {
-  const output = vscode.window.createOutputChannel('Agent Bridge Spike');
-  output.appendLine('=== Agent Bridge Spike activated ===');
+  const output = vscode.window.createOutputChannel('Agent Bridge');
+  output.appendLine('=== Agent Bridge activated ===');
   output.appendLine(`Time: ${new Date().toISOString()}`);
   output.appendLine('');
 
-  // ------------------------------------------------------------------
-  // 1. Get Cline's exports and log the available methods
-  // ------------------------------------------------------------------
+  // ---- 1. Get Cline's exports ----
   const clineExt: any = vscode.extensions.getExtension('saoudrizwan.claude-dev');
   if (!clineExt) {
     output.appendLine('ERROR: Cline extension (saoudrizwan.claude-dev) is not installed.');
     output.show(true);
     return;
   }
-
   const cline = (clineExt.exports as Record<string, unknown>) || {};
   const methodNames = cline ? Object.keys(cline) : [];
-  output.appendLine(`Cline extension id: ${clineExt.id}`);
-  output.appendLine(`Cline extensionUri: ${clineExt.extensionUri.fsPath}`);
-  output.appendLine(`Cline globalStorageUri: ${clineExt.globalStorageUri?.fsPath}`);
-  output.appendLine(`Our globalStorageUri: ${context.globalStorageUri.fsPath}`);
-  output.appendLine(`Cline exported methods (${methodNames.length}): ${methodNames.join(', ') || '(none)'}`);
-  for (const name of methodNames) {
-    output.appendLine(`  ${name}: ${typeof cline[name]}`);
+  // ---- 2. Load policy.json ----
+  const policyPath = path.join(context.extensionPath, 'media', 'policy.json');
+  let policy: any[] = [];
+  try {
+    policy = JSON.parse(fs.readFileSync(policyPath, 'utf8'));
+  } catch (e) {
+    output.appendLine(`WARN: could not load policy.json: ${e}`);
   }
+  output.appendLine(`Policy rules: ${policy.length}`);
+
+  // ---- 3. Audit log (JSONL to extension global storage) ----
+  const auditLogPath = path.join(context.globalStorageUri.fsPath, 'audit.log');
+  function auditLog(entry: string): void {
+    const line = JSON.stringify({ t: new Date().toISOString(), msg: entry }) + '\n';
+    try { fs.appendFileSync(auditLogPath, line); } catch {}
+    output.appendLine(entry);
+  }
+  output.appendLine(`Audit log: ${auditLogPath}`);
   output.appendLine('');
 
-  // ------------------------------------------------------------------
-  // 2. Locate Cline's global storage folder.
-  //    Prefer clineExt.globalStorageUri; fall back to deriving the sibling
-  //    folder from our own globalStorageUri.
-  // ------------------------------------------------------------------
-  let clineStorageDir: string | undefined;
-  if (clineExt.globalStorageUri?.fsPath) {
-    clineStorageDir = clineExt.globalStorageUri.fsPath;
-    output.appendLine(`Using Cline globalStorageUri: ${clineStorageDir}`);
-  } else {
-    const ourDir = path.dirname(context.globalStorageUri.fsPath);
-    clineStorageDir = path.join(ourDir, 'saoudrizwan.claude-dev');
-    output.appendLine(`Derived Cline storage (sibling): ${clineStorageDir}`);
-  }
-  output.appendLine('');
-  // ------------------------------------------------------------------
-  // 3. Discover storage artifacts (read-only).
-  //    Prioritize .jsonl session files. Also track sessions.db (+ WAL/SHM).
-  // ------------------------------------------------------------------
-  const SECRET_RE = /(sk-[A-Za-z0-9]{20,}|[A-Za-z0-9]{32,}|eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*\.[A-Za-z0-9_-]*)/g;
+  // ---- 4. Create Hub ----
+  const hub = new Hub(policy, auditLog);
 
-  function redact(text: string): string {
-    return text.replace(SECRET_RE, '[REDACTED]');
-  }
+  // ---- 5. ClineAdapter (created on first phone connection) ----
+  let clineAdapter: ClineAdapter | null = null;
 
-  function summarizeJsonlLine(line: string): string {
-    if (!line.trim()) return '(empty line)';
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(line);
-    } catch {
-      return `RAW: ${redact(line.slice(0, 200))}${line.length > 200 ? '...' : ''}`;
-    }
-    return `JSON: ${redact(JSON.stringify(parsed).slice(0, 300))}`;
-  }
+  // ---- 6. WebSocket server (127.0.0.1 only) ----
+  const wss = new WebSocketServer({ host: '127.0.0.1', port: 9876 });
+  output.appendLine('WebSocket server: ws://127.0.0.1:9876');
 
-  interface FileState {
-    size: number;
-    mtimeMs: number;
-  }
+  wss.on('connection', (ws: WebSocket) => {
+    output.appendLine('Phone WebSocket connected');
+    hub.setPhoneWebSocket(ws);
 
-  const watchedFiles = new Map<string, FileState>();
-
-  function discoverFiles(dir: string): string[] {
-    const results: string[] = [];
-    try {
-      const entries = fs.readdirSync(dir, { withFileTypes: true });
-      for (const entry of entries) {
-        const full = path.join(dir, entry.name);
-        if (entry.isDirectory()) {
-          results.push(...discoverFiles(full));
-        } else {
-          const lower = entry.name.toLowerCase();
-          if (lower.endsWith('.jsonl') || lower.endsWith('.db') || lower.endsWith('-wal') || lower.endsWith('-shm')) {
-            results.push(full);
-          }
-        }
-      }
-    } catch (e) {
-      output.appendLine(`Could not list storage dir ${dir}: ${e}`);
-    }
-    results.sort((a, b) => {
-      const rank = (f: string) => {
-        const l = f.toLowerCase();
-        if (l.endsWith('.jsonl')) return 0;
-        if (l.endsWith('.db')) return 1;
-        if (l.endsWith('-wal')) return 2;
-        return 3;
-      };
-      return rank(a) - rank(b);
-    });
-    return results;
-  }
-
-  // ------------------------------------------------------------------
-  // 4. Log a storage change: timestamp, size, message count, last 3 msgs
-  // ------------------------------------------------------------------
-  function logStorageChange(file: string, reason: string): void {
-    let stat: fs.Stats;
-    try {
-      stat = fs.statSync(file);
-    } catch {
-      return;
-    }
-    const prev = watchedFiles.get(file);
-    watchedFiles.set(file, { size: stat.size, mtimeMs: stat.mtimeMs });
-
-    const lower = file.toLowerCase();
-    output.appendLine(`[${new Date().toISOString()}] ${reason} :: ${file}`);
-    output.appendLine(`  size=${stat.size} mtime=${new Date(stat.mtime).toISOString()}`);
-
-    if (lower.endsWith('.jsonl')) {
-      let lines: string[] = [];
-      try {
-        const content = fs.readFileSync(file, 'utf8');
-        lines = content.split(/\r?\n/).filter((l: string) => l.trim().length > 0);
-      } catch (e) {
-        output.appendLine(`  read error: ${e}`);
-        return;
-      }
-      output.appendLine(`  message lines=${lines.length}`);
-      const last3 = lines.slice(-3);
-      for (const ln of last3) {
-        output.appendLine(`  last: ${redact(summarizeJsonlLine(ln))}`);
-      }
-    } else if (lower.endsWith('.db') || lower.endsWith('-wal') || lower.endsWith('-shm')) {
-      output.appendLine('  (SQLite/WAL/SHM — read-only: size & mtime logged above, no content read)');
-    }
-    output.appendLine('');
-  }
-  // ------------------------------------------------------------------
-  // 5. Watch storage: fs.watch with 500 ms polling fallback (Windows)
-  // ------------------------------------------------------------------
-  let pollTimer: NodeJS.Timeout | null = null;
-  let watcher: fs.FSWatcher | null = null;
-
-  function startWatching(dir: string): void {
-    output.appendLine(`Watching storage dir: ${dir}`);
-    // initial discovery + log
-    const files = discoverFiles(dir);
-    output.appendLine(`Discovered ${files.length} tracked file(s):`);
-    for (const f of files) {
-      output.appendLine(`  - ${f}`);
-      logStorageChange(f, 'initial');
-    }
-
-    // Try fs.watch on the directory (recursive not reliably supported on Windows)
-    try {
-      watcher = fs.watch(dir, { recursive: true }, (eventType: string, filename: string | null) => {
-        if (!filename) return;
-        const full = path.join(dir, filename);
-        const lower = filename.toLowerCase();
-        if (lower.endsWith('.jsonl') || lower.endsWith('.db') || lower.endsWith('-wal') || lower.endsWith('-shm')) {
-          output.appendLine(`fs.watch event: ${eventType} ${filename}`);
-          setTimeout(() => logStorageChange(full, 'watch'), 100);
+    if (!clineAdapter) {
+      clineAdapter = new ClineAdapter('ws://127.0.0.1:9876/ws', auditLog);
+      hub.setOnPhoneMessage((msg) => {
+        switch (msg.t) {
+          case 'prompt': clineAdapter?.startTask(msg.text); break;
+          case 'message': clineAdapter?.sendMessage(msg.text); break;
+          case 'approve': clineAdapter?.approve(msg.id); break;
+          case 'reject': clineAdapter?.reject(msg.id, msg.reason || ''); break;
+          case 'cancel': clineAdapter?.cancel(); break;
         }
       });
-      output.appendLine('fs.watch active (recursive).');
-    } catch (e) {
-      output.appendLine(`fs.watch failed: ${e}; falling back to polling.`);
+      clineAdapter.onEvent((event) => {
+        const out: any = { t: event.type, agent: 'cline' };
+        if (event.type === 'say') { out.text = event.text; out.partial = event.partial; }
+        if (event.type === 'think') { out.text = event.text; }
+        if (event.type === 'ask') { out.id = event.id; out.kind = event.kind; out.text = event.text; }
+        if (event.type === 'state') { out.status = event.status; out.progress = event.progress; }
+        hub.sendToPhone(out);
+      });
     }
+  });
 
-    // 500 ms polling fallback / supplement
-    pollTimer = setInterval(() => {
-      const files = discoverFiles(dir);
-      for (const f of files) {
-        try {
-          const stat = fs.statSync(f);
-          const prev = watchedFiles.get(f);
-          if (!prev || prev.size !== stat.size || prev.mtimeMs !== stat.mtimeMs) {
-            logStorageChange(f, 'poll');
-          }
-        } catch {
-          // file may have been removed
-        }
-      }
-    }, 500);
-    output.appendLine('Polling at 500 ms interval.');
-  }
+  wss.on('error', (e: Error) => {
+    output.appendLine(`WebSocket server error: ${e.message}`);
+  });
 
-  // ------------------------------------------------------------------
-  // 6. Register the "Agent Bridge: Spike" command
-  // ------------------------------------------------------------------
+  // ---- 7. Register "Agent Bridge: Spike" command ----
   context.subscriptions.push(
     vscode.commands.registerCommand('agent-bridge.spike', async () => {
       output.appendLine('--- Command: Agent Bridge: Spike ---');
@@ -210,117 +97,31 @@ export function activate(context: vscode.ExtensionContext): void {
         return;
       }
       try {
-        await (cline.startNewTask as (...args: unknown[]) => Promise<unknown>)(
+        await (cline.startNewTask as (...args: unknown[]) => Promise<void>)(
           'Say hello and list the files in the workspace root'
         );
-        output.appendLine('startNewTask("Say hello and list the files in the workspace root") completed.');
+        output.appendLine('startNewTask completed.');
       } catch (e) {
         output.appendLine(`startNewTask error: ${e}`);
-      }
-      // Kick off storage watching now that a task may exist
-      if (clineStorageDir && fs.existsSync(clineStorageDir)) {
-        if (!watcher && !pollTimer) {
-          startWatching(clineStorageDir);
-        }
-      } else {
-        output.appendLine(`Cline storage dir not found yet: ${clineStorageDir}`);
-        output.appendLine('(Create a task in Cline first, then re-run this command.)');
       }
       output.show(true);
     })
   );
 
-  // Start watching immediately if storage already exists
-  if (clineStorageDir && fs.existsSync(clineStorageDir)) {
-    startWatching(clineStorageDir);
-  }
+  // ---- 8. Register "Agent Bridge: Show Pairing URL" command ----
+  context.subscriptions.push(
+    vscode.commands.registerCommand('agent-bridge.show-pairing', () => {
+      const url = 'ws://127.0.0.1:9876/ws';
+      output.appendLine(`Pairing URL: ${url}`);
+      vscode.window.showInformationMessage(`Agent Bridge pairing URL: ${url}`);
+      output.show(true);
+    })
+  );
 
-  output.appendLine('Setup complete. Run "Agent Bridge: Spike" to start a task and watch storage.');
+  output.appendLine('Setup complete. Run "Agent Bridge: Show Pairing URL" to get the WebSocket URL.');
   output.show(true);
-
-  // ------------------------------------------------------------------
-  // 7. Auto-start the storage watcher (poll until storage appears)
-  // ------------------------------------------------------------------
-  let watchRetryTimer: any = null;
-
-  function ensureWatcher(): void {
-    if (watcher || pollTimer) return;
-    if (clineStorageDir && fs.existsSync(clineStorageDir)) {
-      startWatching(clineStorageDir);
-      return;
-    }
-    output.appendLine(`Cline storage not found yet: ${clineStorageDir}. Waiting...`);
-    watchRetryTimer = setInterval(() => {
-      if (clineStorageDir && fs.existsSync(clineStorageDir)) {
-        clearInterval(watchRetryTimer);
-        watchRetryTimer = null;
-        startWatching(clineStorageDir);
-        output.appendLine('Storage detected — watching now.');
-      }
-    }, 2000);
-  }
-
-  ensureWatcher();
-
-  // ------------------------------------------------------------------
-  // 8. Input box: type a prompt and send it directly to Cline
-  // ------------------------------------------------------------------
-  const inputBox = vscode.window.createInputBox();
-  inputBox.title = 'Agent Bridge — prompt to Cline';
-  inputBox.placeholder = 'Type a prompt and press Enter to send...';
-  inputBox.ignoreFocusOut = false;
-  inputBox.prompt = 'Send as new task (default), or send as message?';
-  inputBox.value = '';
-
-  const modePick = vscode.window.createQuickPick();
-  modePick.title = 'Send mode';
-  modePick.placeholder = 'How to send the prompt';
-  modePick.items = [
-    { label: 'Start new task', description: 'startNewTask(prompt)', picked: true },
-    { label: 'Send as message', description: 'sendMessage(prompt)', picked: false },
-  ];
-  modePick.ignoreFocusOut = false;
-
-  inputBox.onDidAccept(async () => {
-    const text = inputBox.value.trim();
-    if (!text) {
-      inputBox.value = '';
-      return;
-    }
-    if (modePick.selectedItems.length === 0) {
-      modePick.show();
-      inputBox.hide();
-      return;
-    }
-    const active = modePick.selectedItems[0];
-    try {
-      if (active.label === 'Start new task') {
-        await (cline.startNewTask as (...args: unknown[]) => Promise<void>)(text);
-        output.appendLine(`startNewTask("${text.substring(0, 40)}...") sent.`);
-      } else {
-        await (cline.sendMessage as (msg: string) => Promise<void>)(text);
-        output.appendLine(`sendMessage("${text.substring(0, 40)}...") sent.`);
-      }
-    } catch (e) {
-      output.appendLine(`Send error: ${e}`);
-    }
-    inputBox.value = '';
-    modePick.hide();
-    inputBox.show();
-  });
-
-  modePick.onDidAccept(() => {
-    modePick.hide();
-    inputBox.show();
-  });
-
-  inputBox.show();
 }
-
-
 
 export function deactivate(): void {
-  // nothing to clean up (no writes were ever made to Cline's files)
+  // nothing to clean up (WebSocket server closed on extension deactivate)
 }
-
-

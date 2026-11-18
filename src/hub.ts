@@ -27,8 +27,8 @@ export interface PolicyRule {
 
 // ----- Hub Class -----
 export class Hub {
-  private ws: WebSocket | null = null
-  private phoneWs: WebSocket | null = null
+  private ws: any = null
+  private phoneWs: any = null
   private policy: PolicyRule[]
   private auditLog: (entry: string) => void
   private replayBuffer: Map<string, number> = new Map() // timestamp->messageKey
@@ -51,9 +51,9 @@ export class Hub {
     }
   }
 
-  setPhoneWebSocket = (ws: WebSocket): void => {
+  setPhoneWebSocket = (ws: any): void => {
     this.phoneWs = ws
-    this.phoneWs.onmessage = (event) => this.handlePhoneMessage(event)
+    this.phoneWs.onmessage = (event: any) => this.handlePhoneMessage(event)
     this.onPhoneConnect()
   }
 
@@ -73,9 +73,9 @@ export class Hub {
     if (this.ws) return
     this.ws = new WebSocket(wsUrl)
     this.ws.onopen = () => this.onConnect()
-    this.ws.onmessage = (event) => this.handleHubOutgoing(event)
+    this.ws.onmessage = (event: any) => this.handleHubOutgoing(event)
     this.ws.onclose = () => this.onDisconnect()
-    this.ws.onerror = (e) => this.onError(e)
+    this.ws.onerror = (e: any) => this.onError(e)
     this.auditLog(`HUB: connected to ${wsUrl}`)
   }
 
@@ -93,7 +93,7 @@ export class Hub {
     }
   }
 
-  private handlePhoneMessage = (event: MessageEvent): void => {
+  private handlePhoneMessage = (event: any): void => {
     try {
       const msg: HubMessage = JSON.parse(event.data as string)
       this.handleIncoming(msg)
@@ -176,5 +176,33 @@ export class Hub {
   private matchesPattern = (pattern: string, text: string): boolean => {
     if (!pattern) return true
     try { return new RegExp(pattern, "i").test(text) } catch { return false }
+  }
+
+  // ----- WebSocket internal handlers -----
+
+  private onConnect = (): void => {
+    this.connectAttempts = 0
+    this.auditLog("HUB: WebSocket connected")
+    this.onPhoneConnect()
+  }
+
+  private handleHubOutgoing = (event: MessageEvent): void => {
+    try {
+      const msg: HubMessage = JSON.parse(event.data as string)
+      this.auditLog(`HUB->OUTGOING:${JSON.stringify(msg)}`)
+      this.sendToPhone(msg)
+    } catch (e) {
+      this.auditLog(`ERROR: parse hub outgoing: ${event.data}`)
+    }
+  }
+
+  private onDisconnect = (): void => {
+    this.connectAttempts++
+    this.auditLog(`HUB: WebSocket disconnected (attempt ${this.connectAttempts})`)
+    this.onPhoneDisconnect()
+  }
+
+  private onError = (e: any): void => {
+    this.auditLog(`HUB: WebSocket error`)
   }
 }
