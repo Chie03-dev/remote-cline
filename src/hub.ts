@@ -40,6 +40,11 @@ export class Hub {
   private onPhoneMessage: (msg: HubMessage) => void = () => {}
   private onPhoneConnect: () => void = () => {}
   private onPhoneDisconnect: () => void = () => {}
+  private onPrompt: (text: string) => void = () => {}
+  private onApprove: (id: string) => void = () => {}
+  private onReject: (id: string, reason: string) => void = () => {}
+  private onCancel: () => void = () => {}
+  private pendingPrompts: Map<string, string> = new Map()
 
   constructor(policy: PolicyRule[], auditLog: (entry: string) => void) {
     this.policy = policy
@@ -67,6 +72,22 @@ export class Hub {
 
   setOnPhoneDisconnect = (callback: () => void): void => {
     this.onPhoneDisconnect = callback
+  }
+
+  setOnPrompt = (callback: (text: string) => void): void => {
+    this.onPrompt = callback
+  }
+
+  setOnApprove = (callback: (id: string) => void): void => {
+    this.onApprove = callback
+  }
+
+  setOnReject = (callback: (id: string, reason: string) => void): void => {
+    this.onReject = callback
+  }
+
+  setOnCancel = (callback: () => void): void => {
+    this.onCancel = callback
   }
 
   connect = (wsUrl: string): void => {
@@ -139,28 +160,41 @@ export class Hub {
     }
 
     // ask - forward to phone
-    this.auditLog(`FORWARD:ask:${text.substring(0, 50)}...`)
+    const id = `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`
+    this.pendingPrompts.set(id, text)
+    this.auditLog(`FORWARD:ask:${id}:${text.substring(0, 50)}...`)
     this.sendToPhone({
       t: "ask",
       agent: agent,
-      id: `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+      id,
       kind: "command",
       text: text
     })
   }
 
   private handleApprove(msg: HubMessage): void {
-    this.auditLog(`APPROVE:${msg.id}`)
+    const text = this.pendingPrompts.get(msg.id)
+    this.pendingPrompts.delete(msg.id)
+    if (text !== undefined) {
+      this.auditLog(`APPROVE:${msg.id} -> run task`)
+      this.onApprove(msg.id)
+      this.onPrompt(text)
+    } else {
+      this.auditLog(`APPROVE:${msg.id}`)
+    }
     this.sendToPhone({ t: "state", agent: "cline", status: "done" })
   }
 
   private handleReject(msg: HubMessage): void {
+    this.pendingPrompts.delete(msg.id)
     this.auditLog(`REJECT:${msg.id}`)
+    this.onReject(msg.id, msg.reason ?? "rejected")
     this.sendToPhone({ t: "state", agent: "cline", status: "done" })
   }
 
   private handleCancel(): void {
     this.auditLog(`CANCEL`)
+    this.onCancel()
     this.sendToPhone({ t: "state", agent: "cline", status: "done" })
   }
 
