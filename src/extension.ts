@@ -144,20 +144,29 @@ export function activate(context: vscode.ExtensionContext): void {
     if (!m || typeof m !== 'object') return;
     const role = m.role;
     const content: any[] = m.content || [];
+    const id = m.id;
+    const ts = m.ts ? new Date(m.ts).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit',second:'2-digit'}) : '--:--';
     for (const part of content) {
       if (!part || typeof part !== 'object') continue;
       const type = part.type;
       if (role === 'assistant') {
         if (type === 'thinking') {
-          clineAdapter?.think(String(part.thinking || ''));
+          const text = String(part.thinking || '');
+          output.appendLine(`THINK[${ts}]: ${redact(text.substring(0, 120))}`);
+          clineAdapter?.think(text);
         } else if (type === 'text') {
-          clineAdapter?.say(String(part.text || ''), false);
+          const text = String(part.text || '');
+          output.appendLine(`SAY[${ts}]: ${redact(text.substring(0, 120))}`);
+          clineAdapter?.say(text, false);
         } else if (type === 'tool_use') {
           const kind = toolKind(part.name);
-          clineAdapter?.ask(String(m.id), kind, JSON.stringify(part.input || {}));
+          const body = JSON.stringify(part.input || {});
+          output.appendLine(`ASK[${ts}][${kind}]: ${redact(body.substring(0, 120))}`);
+          clineAdapter?.ask(String(id), kind, body);
         } else if (type === 'tool_result') {
-          const result = part.content || '';
-          clineAdapter?.say(String(result), false);
+          const result = String(part.content || '');
+          output.appendLine(`SAY[${ts}][tool_result]: ${redact(result.substring(0, 120))}`);
+          clineAdapter?.say(result, false);
         }
       }
     }
@@ -174,6 +183,7 @@ export function activate(context: vscode.ExtensionContext): void {
         if (!prev) {
           // First discovery: seed with current length so we don't replay history
           msgFileStates.set(sessionId, { processedMsgs: messages.length });
+          output.appendLine(`SESSION[${sessionId}]: discovered, ${messages.length} existing messages`);
           continue;
         }
         if (prev.processedMsgs !== messages.length) {
@@ -194,6 +204,7 @@ export function activate(context: vscode.ExtensionContext): void {
               if (s === 'waiting' || s === 'pending') return 'waiting';
               return 'done';
             };
+            output.appendLine(`STATE[${sessionId}]: ${newStatus}`);
             clineAdapter?.state(mapStatus(newStatus));
           }
         }
