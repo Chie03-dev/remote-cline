@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
 import { WebSocketServer } from 'ws';
 import { Hub } from './hub';
@@ -27,11 +28,6 @@ export function activate(context: vscode.ExtensionContext): void {
   const cline = (clineExt.exports as Record<string, unknown>) || {};
   const methodNames = cline ? Object.keys(cline) : [];
   output.appendLine(`Cline exported methods: ${methodNames.join(', ') || '(none)'}`);
-  // Diagnostic: dump every export property name + type
-  for (const k of methodNames) {
-    const v = cline[k];
-    output.appendLine(`  ${k}: ${typeof v}${v && typeof v === 'object' ? ' keys=' + Object.keys(v).join(',') : ''}`);
-  }
   output.appendLine('');
 
   const callCline = (name: string, ...args: unknown[]): unknown => {
@@ -65,16 +61,11 @@ export function activate(context: vscode.ExtensionContext): void {
   output.appendLine(`Audit log: ${auditLogPath}`);
   output.appendLine('');
 
-  // 4. Derive Cline's global storage directory
-  let clineStorageDir: string | undefined;
-  if (clineExt.globalStorageUri?.fsPath) {
-    clineStorageDir = clineExt.globalStorageUri.fsPath;
-    output.appendLine(`Cline storage: ${clineStorageDir}`);
-  } else {
-    const ourDir = path.dirname(context.globalStorageUri.fsPath);
-    clineStorageDir = path.join(ourDir, 'saoudrizwan.claude-dev');
-    output.appendLine(`Derived Cline storage: ${clineStorageDir}`);
-  }
+  // 4. Derive Cline's data directory (~/.cline/data) and sessions dir
+  const clineDataDir = path.join(os.homedir(), '.cline', 'data');
+  const sessionsDir = path.join(clineDataDir, 'sessions');
+  output.appendLine(`Cline data dir: ${clineDataDir}`);
+  output.appendLine(`Sessions dir: ${sessionsDir}`);
   output.appendLine('');
 
   // 5. Create Hub
@@ -101,41 +92,40 @@ export function activate(context: vscode.ExtensionContext): void {
   // 6. ClineAdapter (created on first phone connection)
   let clineAdapter: ClineAdapter | null = null;
 
-  // ----- Storage watcher: tail Cline's JSONL, feed adapter events -----
+  // ----- Storage watcher: tail Cline's session messages.json, feed adapter events -----
 
-  interface FileState { size: number; mtimeMs: number }
-  const watchedFiles = new Map<string, FileState>();
+  interface MsgFileState { processedMsgs: number }
+  const msgFileStates = new Map<string, MsgFileState>();
 
-  function discoverFiles(dir: string): string[] {
+  interface SessionStatusState { status: string }
+  const sessionStatus = new Map<string, SessionStatusState>();
+
+  function discoverSessions(dir: string): string[] {
     const results: string[] = [];
     try {
       const entries = fs.readdirSync(dir, { withFileTypes: true });
       for (const entry of entries) {
-        const full = path.join(dir, entry.name);
-        if (entry.isDirectory()) {
-          results.push(...discoverFiles(full));
-        } else {
-          const lower = entry.name.toLowerCase();
-          if (lower.endsWith('.jsonl')) results.push(full);
-        }
+        if (entry.isDirectory()) results.push(path.join(dir, entry.name));
       }
     } catch {}
     return results.sort((a, b) => b.localeCompare(a));
   }
 
-  const fileOffsets = new Map<string, number>();
+  function readSessionMessages(sessionDir: string): { messages: any[]; updated_at?: string } | null {
+    const sessionId = path.basename(sessionDir);
+    const messagesPath = path.join(sessionDir, `${sessionId}.messages.json`);
+    try {
+      const content = fs.readFileSync(messagesPath, 'utf8');
+      return JSON.parse(content);
+    } catch { return null; }
+  }
 
-  function readNewLines(file: string): string[] {
-    const prevOffset = fileOffsets.get(file) ?? 0;
-    let content: string;
-    try { content = fs.readFileSync(file, 'utf8'); }
-    catch { return []; }
-    const lines = content.split(/\r?\n/).filter(l => l.trim().length > 0);
-    const newLines = lines.slice(prevOffset);
-    if (newLines.length > 0) {
-      fileOffsets.set(file, lines.length);
-    }
-    return newLines;
+  function readSessionStatus(sessionDir: string): { status?: string } | null {
+    const sessionId = path.basename(sessionDir);
+    const sessionPath = path.join(sessionDir, `${sessionId}.json`);
+    try {
+      return JSON.parse(fs.readFileSync(sessionPath, 'utf8'));
+    } catch { return null; }
   }
 
   const SECRET_RE = /(sk-[A-Za-z0-9]{20,}|[A-Za-z0-9]{32,}|eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*\.[A-Za-z0-9_-]*)/g;
@@ -143,90 +133,92 @@ export function activate(context: vscode.ExtensionContext): void {
     return text.replace(SECRET_RE, '[REDACTED]');
   }
 
-  function summarizeJsonlLine(line: string): string {
-    try {
-      const parsed = JSON.parse(line);
-      return redact(JSON.stringify(parsed).slice(0, 300));
-    } catch {
-      return `RAW: ${redact(line.slice(0, 200))}${line.length > 200 ? '...' : ''}`;
+  function toolKind(name: string): 'command' | 'edit' | 'other' {
+    const n = String(name || '').toLowerCase();
+    if (n === 'run_commands' || n === 'execute_command' || n === 'run_command') return 'command';
+    if (n.includes('file') || n.includes('edit') || n === 'write_file' || n === 'read_file' || n === 'edit_file') return 'edit';
+    return 'other';
+  }
+
+  function feedMessage(m: any): void {
+    if (!m || typeof m !== 'object') return;
+    const role = m.role;
+    const content: any[] = m.content || [];
+    for (const part of content) {
+      if (!part || typeof part !== 'object') continue;
+      const type = part.type;
+      if (role === 'assistant') {
+        if (type === 'thinking') {
+          clineAdapter?.think(String(part.thinking || ''));
+        } else if (type === 'text') {
+          clineAdapter?.say(String(part.text || ''), false);
+        } else if (type === 'tool_use') {
+          const kind = toolKind(part.name);
+          clineAdapter?.ask(String(m.id), kind, JSON.stringify(part.input || {}));
+        } else if (type === 'tool_result') {
+          const result = part.content || '';
+          clineAdapter?.say(String(result), false);
+        }
+      }
     }
   }
 
-  let askSeq = 0;
-
-  function feedJsonlLine(line: string): void {
-    let parsed: any;
-    try { parsed = JSON.parse(line); } catch { return; }
-    if (!parsed || typeof parsed !== 'object') return;
-    const { type, say, ask, text, reasoning, partial } = parsed;
-    const body = typeof text === 'string' ? text : (typeof reasoning === 'string' ? reasoning : '');
-    if (!body) return;
-
-    switch (type) {
-      case 'say': {
-        const kind = String(say || '');
-        if (kind === 'reasoning' || kind === 'thinking') {
-          clineAdapter?.think(body);
-        } else if (kind === 'text' || kind === 'error' || kind === 'user_message' || kind === '') {
-          clineAdapter?.say(body, partial !== false);
-        } else if (kind === 'api_req_started') {
-          clineAdapter?.state('working');
-        } else if (kind === 'api_req_finished') {
-          clineAdapter?.state('done');
-        } else {
-          clineAdapter?.say(body, partial !== false);
+  function pollSessions(dir: string): void {
+    for (const sessionDir of discoverSessions(dir)) {
+      try {
+        const data = readSessionMessages(sessionDir);
+        if (!data) continue;
+        const sessionId = path.basename(sessionDir);
+        const messages: any[] = data.messages || [];
+        const prev = msgFileStates.get(sessionId);
+        if (!prev) {
+          // First discovery: seed with current length so we don't replay history
+          msgFileStates.set(sessionId, { processedMsgs: messages.length });
+          continue;
         }
-        break;
-      }
-      case 'ask': {
-        const kind = String(ask || 'other');
-        const id = `ask-${++askSeq}`;
-        const k = kind as 'command' | 'edit' | 'other';
-        if (kind === 'command') clineAdapter?.ask(id, 'command', body);
-        else if (kind === 'followup') clineAdapter?.ask(id, 'other', body);
-        else clineAdapter?.ask(id, k, body);
-        break;
-      }
-      case 'state':
-        clineAdapter?.state(parsed.status ?? 'done', parsed.progress);
-        break;
-      default:
-        output.appendLine(`JSONL: ${redact(summarizeJsonlLine(line))}`);
+        if (prev.processedMsgs !== messages.length) {
+          msgFileStates.set(sessionId, { processedMsgs: messages.length });
+          const newMsgs = messages.slice(prev.processedMsgs);
+          for (const m of newMsgs) feedMessage(m);
+        }
+
+        // Session status -> state event
+        const st = readSessionStatus(sessionDir);
+        const newStatus = st?.status;
+        if (newStatus) {
+          const prevStatus = sessionStatus.get(sessionId);
+          if (!prevStatus || prevStatus.status !== newStatus) {
+            sessionStatus.set(sessionId, { status: newStatus });
+            const mapStatus = (s: string): 'working' | 'waiting' | 'done' => {
+              if (s === 'working' || s === 'running') return 'working';
+              if (s === 'waiting' || s === 'pending') return 'waiting';
+              return 'done';
+            };
+            clineAdapter?.state(mapStatus(newStatus));
+          }
+        }
+      } catch {}
     }
   }
 
   let pollTimer: NodeJS.Timeout | null = null;
   let watcher: fs.FSWatcher | null = null;
 
-  function pollStorage(dir: string): void {
-    for (const f of discoverFiles(dir)) {
-      try {
-        const stat = fs.statSync(f);
-        const prev = watchedFiles.get(f);
-        if (!prev || prev.size !== stat.size || prev.mtimeMs !== stat.mtimeMs) {
-          watchedFiles.set(f, { size: stat.size, mtimeMs: stat.mtimeMs });
-          const lines = readNewLines(f);
-          for (const ln of lines) feedJsonlLine(ln);
-        }
-      } catch {}
-    }
+  function pollSessionsDir(dir: string): void {
+    pollSessions(dir);
   }
 
   function startWatching(dir: string): void {
-    output.appendLine(`Watching storage dir: ${dir}`);
-    const files = discoverFiles(dir);
-    for (const f of files) {
-      try { watchedFiles.set(f, fs.statSync(f)); } catch {}
-    }
+    output.appendLine(`Watching sessions dir: ${dir}`);
     try {
       watcher = fs.watch(dir, { recursive: true }, () => {
-        setTimeout(() => pollStorage(dir), 100);
+        setTimeout(() => pollSessionsDir(dir), 100);
       });
       output.appendLine('fs.watch active.');
     } catch (e) {
       output.appendLine(`fs.watch failed: ${e}; polling only.`);
     }
-    pollTimer = setInterval(() => pollStorage(dir), 500);
+    pollTimer = setInterval(() => pollSessionsDir(dir), 500);
     output.appendLine('Polling at 500 ms interval.');
   }
 
@@ -273,10 +265,10 @@ export function activate(context: vscode.ExtensionContext): void {
       } catch (e) {
         output.appendLine(`startNewTask error: ${e}`);
       }
-      if (clineStorageDir && fs.existsSync(clineStorageDir)) {
-        if (!watcher && !pollTimer) startWatching(clineStorageDir);
+      if (fs.existsSync(sessionsDir)) {
+        if (!watcher && !pollTimer) startWatching(sessionsDir);
       } else {
-        output.appendLine(`Cline storage dir not found yet: ${clineStorageDir}`);
+        output.appendLine(`Cline sessions dir not found yet: ${sessionsDir}`);
       }
       output.show(true);
     })
